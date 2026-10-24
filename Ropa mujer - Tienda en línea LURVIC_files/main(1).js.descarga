@@ -1,0 +1,41 @@
+function digitsOnlyPhone(phone) {
+  return String(phone || "").replace(/\D/g, "");
+}
+
+function buildWaMeUrl(phone, message, pageUrl) {
+  const digits = digitsOnlyPhone(phone);
+  const text = [message, pageUrl]
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  const url = new URL(`https://wa.me/${digits}`);
+  if (text) url.searchParams.set("text", text);
+  return url.toString();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll("[data-wa-phone]").forEach((link) => {
+    if (link.dataset.offline === "true" || link.getAttribute("aria-disabled") === "true") return;
+    link.setAttribute(
+      "href",
+      buildWaMeUrl(link.getAttribute("data-wa-phone"), link.getAttribute("data-wa-message"), link.getAttribute("data-wa-page")),
+    );
+  });
+
+  const dialogElem = document.getElementById("wa-popup-dialog");
+  const toggleBtn = document.getElementById("wa-btn");
+  const ogIcon = document.getElementById("wa-btn-icon");
+  const text = document.getElementById("wa-btn-text");
+  const closeIcon = document.getElementById("wa-btn-icon-close");
+
+  if (!toggleBtn || !dialogElem || !ogIcon || !closeIcon) return;
+
+  toggleBtn.addEventListener("click", () => {
+    const open = dialogElem.classList.contains("wa-popup-dialog-open");
+    dialogElem.classList.toggle("wa-popup-dialog-open", !open);
+    closeIcon.classList.toggle("wa-btn-icon-close-open", !open);
+    ogIcon.classList.toggle("wa-btn-icon-hide", !open);
+    toggleBtn.classList.toggle("wa-btn-hide", !open);
+    if (text) text.classList.toggle("wa-btn-text-hide", !open);
+  });
+});

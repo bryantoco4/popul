@@ -1,0 +1,561 @@
+/* global gtag, fbq */
+/**
+ * Storefront behaviour for business hours, targeting, analytics, and opt-in.
+ * agentDisplayState and matchesTargeting must stay in sync with app/widget/logic.ts.
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = api;
+  }
+  root.WaWidget = api;
+  if (typeof document !== "undefined") {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", function () {
+        api.boot();
+      });
+    } else {
+      api.boot();
+    }
+  }
+})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+  var DAY_KEYS = { Mon: "mon", Tue: "tue", Wed: "wed", Thu: "thu", Fri: "fri", Sat: "sat", Sun: "sun" };
+  var PAGE_MAP = {
+    index: "home",
+    product: "product",
+    collection: "collection",
+    cart: "cart",
+    page: "page",
+    blog: "blog",
+    article: "article",
+    search: "search",
+  };
+
+  function canonicalPage(pageType) {
+    return PAGE_MAP[pageType] || "other";
+  }
+
+  function parseMinutes(value) {
+    var match = /^(\d{1,2}):(\d{2})$/.exec(String(value || "").trim());
+    if (!match) return null;
+    var hours = Number(match[1]);
+    var minutes = Number(match[2]);
+    if (hours > 23 || minutes > 59) return null;
+    return hours * 60 + minutes;
+  }
+
+  function partsInTimeZone(now, timeZone) {
+    var zone = timeZone || "UTC";
+    var parts;
+    try {
+      parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: zone,
+        weekday: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(now);
+    } catch (error) {
+      parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: "UTC",
+        weekday: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(now);
+    }
+    var weekday = "Mon";
+    var hour = 0;
+    var minute = 0;
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].type === "weekday") weekday = parts[i].value;
+      if (parts[i].type === "hour") hour = Number(parts[i].value);
+      if (parts[i].type === "minute") minute = Number(parts[i].value);
+    }
+    if (hour === 24) hour = 0;
+    return { day: DAY_KEYS[weekday] || "mon", minutes: hour * 60 + minute };
+  }
+
+  var DAY_ORDER = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+  function previousDay(day) {
+    var index = DAY_ORDER.indexOf(day);
+    return DAY_ORDER[(index + 6) % 7];
+  }
+
+  function matchesWindow(dayHours, minutes, overflow) {
+    if (!dayHours || dayHours.enabled !== true) return false;
+    var start = parseMinutes(dayHours.start);
+    var end = parseMinutes(dayHours.end);
+    if (start === null || end === null || start === end) return false;
+    if (end > start) {
+      if (overflow) return false;
+      return minutes >= start && minutes < end;
+    }
+    if (overflow) return minutes < end;
+    return minutes >= start;
+  }
+
+  function isWithinHours(availability, now) {
+    var when = partsInTimeZone(now, availability.timezone);
+    if (matchesWindow(availability.days && availability.days[when.day], when.minutes, false)) return true;
+    var prev = previousDay(when.day);
+    return matchesWindow(availability.days && availability.days[prev], when.minutes, true);
+  }
+
+  function agentDisplayState(availability, now) {
+    if (!availability || availability.enabled !== true) return "show";
+    if (isWithinHours(availability, now)) return "show";
+    return availability.outsideHours === "offline" ? "offline" : "hide";
+  }
+
+  function cleanList(values) {
+    if (!Array.isArray(values)) return [];
+    var list = [];
+    for (var i = 0; i < values.length && list.length < 100; i++) {
+      if (typeof values[i] === "string" && values[i].trim()) list.push(values[i].trim());
+    }
+    return list;
+  }
+
+  function normalizePathPattern(pattern) {
+    var path = String(pattern || "").trim();
+    if (path.charAt(0) !== "/") path = "/" + path;
+    if (path.length > 1 && path.charAt(path.length - 1) === "/") path = path.slice(0, -1);
+    return path;
+  }
+
+  function pathMatches(pattern, path) {
+    var normalized = normalizePathPattern(pattern);
+    var pathOnly = String(path || "/").split("?")[0].split("#")[0] || "/";
+    var clean = pathOnly.length > 1 && pathOnly.charAt(pathOnly.length - 1) === "/" ? pathOnly.slice(0, -1) : pathOnly;
+    if (normalized === "/") return true;
+    return clean === normalized || clean.indexOf(normalized + "/") === 0;
+  }
+
+  function matchList(mode, patterns, value, matches) {
+    var list = cleanList(patterns);
+    if (!mode || mode === "all" || list.length === 0) return true;
+    var hit = false;
+    for (var i = 0; i < list.length; i++) {
+      if (matches(list[i], value)) hit = true;
+    }
+    return mode === "include" ? hit : !hit;
+  }
+
+  function matchesTargeting(targeting, ctx) {
+    var rules = targeting || {};
+    var pageKey = canonicalPage(ctx.pageType || "");
+    if (rules.pageTypes && rules.pageTypes[pageKey] === false) return false;
+    if (!matchList(rules.urlMode, rules.urlPatterns, ctx.path || "/", pathMatches)) return false;
+    if (pageKey === "product") {
+      if (
+        !matchList(rules.productMode, rules.productHandles, ctx.productHandle || "", function (pattern, handle) {
+          return pattern.toLowerCase() === handle.toLowerCase();
+        })
+      ) {
+        return false;
+      }
+    }
+    if (pageKey === "collection") {
+      if (
+        !matchList(rules.collectionMode, rules.collectionHandles, ctx.collectionHandle || "", function (pattern, handle) {
+          return pattern.toLowerCase() === handle.toLowerCase();
+        })
+      ) {
+        return false;
+      }
+    }
+    var devices = rules.devices || { desktop: true, mobile: true };
+    if (ctx.device === "mobile" && devices.mobile === false) return false;
+    if (ctx.device === "desktop" && devices.desktop === false) return false;
+    return true;
+  }
+
+  function readConfig() {
+    var el = document.getElementById("wa-widget-config");
+    if (!el) return {};
+    try {
+      return JSON.parse(el.textContent || "{}") || {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function deviceKind() {
+    return window.matchMedia && window.matchMedia("(max-width: 749px)").matches ? "mobile" : "desktop";
+  }
+
+  function proxyUrl(suffix) {
+    var routes = window.Shopify && window.Shopify.routes && window.Shopify.routes.root;
+    var root = routes || "/";
+    if (root.charAt(root.length - 1) !== "/") root += "/";
+    return root + "apps/whatsapp/" + suffix;
+  }
+
+  function pageContext(config) {
+    var page = (config && config.page) || {};
+    return {
+      pageType: page.type || "",
+      pagePath: page.path || (window.location ? window.location.pathname : "/"),
+      productHandle: page.productHandle || "",
+    };
+  }
+
+  function firePixels(event, detail) {
+    var payload = {
+      method: "whatsapp",
+      page_type: detail.pageType || undefined,
+      page_path: detail.pagePath || undefined,
+      item_id: detail.productHandle || undefined,
+      agent_name: detail.agentName || undefined,
+      device: detail.device,
+    };
+    if (typeof gtag === "function") {
+      if (event === "click") {
+        gtag("event", "click", {
+          event_category: "WhatsApp Button",
+          event_label: "Chat Initiated",
+        });
+        gtag("event", "whatsapp_chat_click", payload);
+      } else if (event === "open") {
+        gtag("event", "whatsapp_widget_open", payload);
+      }
+    }
+    if (typeof fbq === "function") {
+      if (event === "click") {
+        fbq("track", "Contact", {
+          content_name: "WhatsApp Chat Button Clicked",
+          content_category: "Chat Initiated",
+        });
+        fbq("trackCustom", "WhatsAppChatClick", {
+          content_name: detail.agentName || "WhatsApp",
+          content_category: detail.pageType || "chat",
+          content_type: "whatsapp",
+        });
+      } else if (event === "open") {
+        fbq("trackCustom", "WhatsAppWidgetOpen", {
+          content_category: detail.pageType || "chat",
+          content_type: "whatsapp",
+        });
+      }
+    }
+  }
+
+  function track(event, extra) {
+    var config = readConfig();
+    var page = pageContext(config);
+    var detail = {
+      event: event,
+      pageType: extra.pageType || page.pageType,
+      pagePath: extra.pagePath || page.pagePath,
+      productHandle: extra.productHandle || page.productHandle || undefined,
+      agentName: extra.agentName || undefined,
+      device: deviceKind(),
+    };
+    if (!detail.productHandle) delete detail.productHandle;
+    if (!detail.agentName) delete detail.agentName;
+    firePixels(event, detail);
+    var url = proxyUrl("events");
+    var body = JSON.stringify(detail);
+    try {
+      if (navigator.sendBeacon) {
+        var blob = new Blob([body], { type: "application/json" });
+        if (navigator.sendBeacon(url, blob)) return;
+      }
+    } catch (error) {
+      /* fetch below */
+    }
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: body,
+      keepalive: true,
+      credentials: "same-origin",
+    }).catch(function () {});
+  }
+
+  function parseAvailability(value) {
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function hideElement(el) {
+    el.setAttribute("hidden", "");
+    el.style.display = "none";
+  }
+
+  function markOffline(link, message) {
+    link.dataset.offline = "true";
+    link.removeAttribute("href");
+    link.setAttribute("aria-disabled", "true");
+    link.classList.add("is-offline");
+    var note = link.querySelector(".wa-agent-offline");
+    if (!note) {
+      note = document.createElement("span");
+      note.className = "wa-agent-offline";
+      var info = link.querySelector(".wa-popup-body-profiles-agents-info") || link;
+      info.appendChild(note);
+    }
+    note.textContent = message || "";
+  }
+
+  function applyAgentHours(container) {
+    var now = new Date();
+    var agents = container.querySelectorAll("[data-agent-link]");
+    var shown = 0;
+    for (var i = 0; i < agents.length; i++) {
+      var link = agents[i];
+      var state = agentDisplayState(parseAvailability(link.getAttribute("data-availability")), now);
+      if (state === "hide") {
+        hideElement(link);
+        continue;
+      }
+      shown += 1;
+      if (state === "offline") {
+        var availability = parseAvailability(link.getAttribute("data-availability"));
+        markOffline(link, (availability && availability.offlineMessage) || container.getAttribute("data-offline-fallback") || "");
+      }
+    }
+    if (agents.length > 0 && shown === 0) hideElement(container);
+
+    if (container.getAttribute("data-click-to-chat") === "true") {
+      var ctcState = agentDisplayState(parseAvailability(container.getAttribute("data-first-availability")), now);
+      var anchor = container.querySelector("a.wa-ctc");
+      if (ctcState === "hide") {
+        hideElement(container);
+      } else if (ctcState === "offline" && anchor) {
+        anchor.dataset.offline = "true";
+        anchor.setAttribute("aria-disabled", "true");
+        anchor.removeAttribute("href");
+        anchor.addEventListener("click", function (event) {
+          event.preventDefault();
+          var note = container.querySelector(".wa-ctc-offline");
+          if (note) note.hidden = false;
+        });
+      }
+    }
+  }
+
+  function revealWhenReady(container, targeting) {
+    var delay = Math.max(0, Math.min(120, Number(targeting.showDelaySeconds) || 0));
+    var scroll = Math.max(0, Math.min(100, Number(targeting.scrollPercent) || 0));
+    if (delay === 0 && scroll === 0) return;
+    container.classList.add("wa-booting");
+    var delayDone = delay === 0;
+    var scrollDone = scroll === 0;
+    function maybeReveal() {
+      if (delayDone && scrollDone) container.classList.remove("wa-booting");
+    }
+    if (!delayDone) {
+      window.setTimeout(function () {
+        delayDone = true;
+        maybeReveal();
+      }, delay * 1000);
+    }
+    if (!scrollDone) {
+      var onScroll = function () {
+        var doc = document.documentElement;
+        var height = doc.scrollHeight - window.innerHeight;
+        var pct = height <= 0 ? 100 : (window.scrollY / height) * 100;
+        if (pct >= scroll) {
+          scrollDone = true;
+          window.removeEventListener("scroll", onScroll);
+          maybeReveal();
+        }
+      };
+      window.addEventListener("scroll", onScroll, { passive: true });
+      onScroll();
+    }
+  }
+
+  function bootChatWidget() {
+    var container = document.querySelector(".wa-popup-container");
+    if (!container || container.getAttribute("data-wa-booted") === "true") return;
+    container.setAttribute("data-wa-booted", "true");
+    var config = readConfig();
+    var targeting = config.targeting || {};
+    var page = config.page || {};
+    var visible = matchesTargeting(targeting, {
+      pageType: page.type || "",
+      path: page.path || window.location.pathname,
+      productHandle: page.productHandle || "",
+      collectionHandle: page.collectionHandle || "",
+      device: deviceKind(),
+    });
+    if (!visible) {
+      hideElement(container);
+      return;
+    }
+    applyAgentHours(container);
+    if (container.hasAttribute("hidden")) return;
+    revealWhenReady(container, targeting);
+
+    var dialog = document.getElementById("wa-popup-dialog");
+    var button = document.getElementById("wa-btn");
+    if (button) {
+      button.addEventListener(
+        "click",
+        function () {
+          if (container.getAttribute("data-click-to-chat") === "true") {
+            var anchor = container.querySelector("a.wa-ctc");
+            if (anchor && anchor.getAttribute("href")) {
+              track("click", { agentName: container.getAttribute("data-first-agent") || "" });
+            }
+            return;
+          }
+          if (dialog && !dialog.classList.contains("wa-popup-dialog-open")) {
+            track("open", {});
+          }
+        },
+        true,
+      );
+    }
+    var links = container.querySelectorAll("[data-agent-link]");
+    for (var i = 0; i < links.length; i++) {
+      links[i].addEventListener("click", function (event) {
+        var link = event.currentTarget;
+        if (link.dataset.offline === "true") {
+          event.preventDefault();
+          return;
+        }
+        track("click", { agentName: link.getAttribute("data-agent-name") || "" });
+      });
+    }
+  }
+
+  function bootAskButtons() {
+    var links = document.querySelectorAll(".wa-ask");
+    var now = new Date();
+    for (var i = 0; i < links.length; i++) {
+      (function (link) {
+        if (link.getAttribute("data-wa-booted") === "true") return;
+        link.setAttribute("data-wa-booted", "true");
+        var state = agentDisplayState(parseAvailability(link.getAttribute("data-availability")), now);
+        if (state === "hide") {
+          hideElement(link);
+          return;
+        }
+        if (state === "offline") {
+          link.dataset.offline = "true";
+          link.removeAttribute("href");
+        }
+        link.addEventListener("click", function (event) {
+          if (link.dataset.offline === "true") {
+            event.preventDefault();
+            var note = link.querySelector(".wa-ask-offline");
+            if (note) note.hidden = false;
+            return;
+          }
+          track("click", {
+            agentName: link.getAttribute("data-agent-name") || "",
+            productHandle: link.getAttribute("data-product-handle") || "",
+            pageType: "product",
+            pagePath: window.location.pathname,
+          });
+        });
+      })(links[i]);
+    }
+  }
+
+  function bootOptIn() {
+    var box = document.getElementById("wa-optin");
+    if (!box || box.getAttribute("data-wa-booted") === "true") return;
+    box.setAttribute("data-wa-booted", "true");
+    var delay = Math.max(0, Math.min(120, Number(box.getAttribute("data-delay") || 0)));
+    var teaser = document.getElementById("wa-optin-teaser");
+    var form = document.getElementById("wa-optin-form");
+    var close = document.getElementById("wa-optin-close");
+    window.setTimeout(function () {
+      box.hidden = false;
+    }, delay * 1000);
+    if (teaser && form) {
+      teaser.addEventListener("click", function () {
+        form.hidden = false;
+        teaser.hidden = true;
+      });
+    }
+    if (close && form && teaser) {
+      close.addEventListener("click", function () {
+        form.hidden = true;
+        teaser.hidden = false;
+      });
+    }
+    if (!form) return;
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var phoneInput = form.querySelector("[name=phone]");
+      var orders = form.querySelector("[name=orders]");
+      var offers = form.querySelector("[name=offers]");
+      var error = form.querySelector(".wa-optin-error");
+      var ordersOptIn = !!(orders && orders.checked);
+      var offersOptIn = !!(offers && offers.checked);
+      if (!ordersOptIn && !offersOptIn) {
+        if (error) {
+          error.hidden = false;
+          error.textContent = box.getAttribute("data-need-box") || "";
+        }
+        return;
+      }
+      if (error) error.hidden = true;
+      fetch(proxyUrl("opt-in"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          phone: phoneInput ? phoneInput.value : "",
+          ordersOptIn: ordersOptIn,
+          offersOptIn: offersOptIn,
+          pagePath: window.location.pathname,
+        }),
+      })
+        .then(function (response) {
+          return response.json().then(function (data) {
+            return { ok: response.ok && data && data.ok };
+          });
+        })
+        .then(function (result) {
+          if (!result.ok) {
+            if (error) {
+              error.hidden = false;
+              error.textContent = box.getAttribute("data-error") || "";
+            }
+            return;
+          }
+          form.textContent = "";
+          var thanks = document.createElement("p");
+          thanks.className = "wa-optin-thanks";
+          thanks.textContent = box.getAttribute("data-thanks") || "";
+          form.appendChild(thanks);
+          track("optin", { pagePath: window.location.pathname });
+        })
+        .catch(function () {
+          if (error) {
+            error.hidden = false;
+            error.textContent = box.getAttribute("data-error") || "";
+          }
+        });
+    });
+  }
+
+  function boot() {
+    var host = typeof globalThis !== "undefined" ? globalThis : window;
+    if (host.__waWidgetBooted) return;
+    host.__waWidgetBooted = true;
+    bootChatWidget();
+    bootAskButtons();
+    bootOptIn();
+  }
+
+  return {
+    agentDisplayState: agentDisplayState,
+    matchesTargeting: matchesTargeting,
+    canonicalPage: canonicalPage,
+    pathMatches: pathMatches,
+    boot: boot,
+  };
+});

@@ -1,0 +1,1143 @@
+const BACKEND_BASE_URL_STATIC = "https://app.getstorelocator.com";
+let shopUrlStatic = "";
+let storeLocationsStatic = [];
+let filteredStoreLocationsStatic = [];
+let storeCoordinatesStatic = {};
+let storeIndexMapStatic = new Map();
+let isExpandedStateStatic = {};
+let selectedStoreIdStatic = null;
+let settingsStatic = {};
+let isStoresListCollapsedStatic = false;
+let storesListMediaQueryStatic = null;
+let storesListListenerStatic = null;
+let mapIframeReadyStatic = false;
+let hasPendingMapSelectionStatic = false;
+
+window.addEventListener("message", (event) => {
+    if (!event.data || event.data.type !== "snts:storeClicked") return;
+    const locatorForClick = document.querySelector('[data-effectify-store-locator]:not([data-is-duplicate])');
+    const sectionForClick = locatorForClick ? locatorForClick.dataset.sectionId : null;
+    const mapFrameStatic = sectionForClick ? document.getElementById(`google-map-iframe-static-${sectionForClick}`) : null;
+    if (mapFrameStatic && event.source === mapFrameStatic.contentWindow) selectStoreFromMapStatic(event.data.storeId);
+});
+
+window.addEventListener("message", (event) => {
+    if (!event.data || event.data.type !== "snts:mapReady") return;
+    const locator = document.querySelector('[data-effectify-store-locator]:not([data-is-duplicate])');
+    const sectionId = locator ? locator.dataset.sectionId : null;
+    if (!sectionId) return;
+    const iframeStatic = document.getElementById(`google-map-iframe-static-${sectionId}`);
+    if (iframeStatic && event.source === iframeStatic.contentWindow) {
+        mapIframeReadyStatic = true;
+        if (hasPendingMapSelectionStatic) {
+            hasPendingMapSelectionStatic = false;
+            sendSelectedStoreToIframeStatic(iframeStatic);
+        }
+    }
+});
+
+document.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || target.getAttribute("role") !== "button") return;
+    if (!target.closest("[data-effectify-store-locator]")) return;
+    event.preventDefault();
+    if (!event.repeat) target.click();
+});
+
+function sendSelectedStoreToIframeStatic(iframeStatic) {
+    if (!iframeStatic || !iframeStatic.contentWindow) return;
+    iframeStatic.contentWindow.postMessage({type: "snts:selectStore", storeId: selectedStoreIdStatic || null}, BACKEND_BASE_URL_STATIC);
+}
+
+function getTodayHoursStatusStatic(hours) {
+    if (!Array.isArray(hours) || hours.length === 0) return null;
+    const todayIdx = new Date().getDay();
+    const today = hours[todayIdx];
+    if (!today) return null;
+    if (!today.closed && today.opens && today.closes) {
+        const [oh, om] = today.opens.split(':').map(Number);
+        const [ch, cm] = today.closes.split(':').map(Number);
+        const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+        const isAllDay = today.opens === '00:00' && today.closes === '00:00';
+        const openNow = isAllDay || (nowMin >= oh * 60 + om && nowMin < ch * 60 + cm);
+        if (openNow) return {isOpen: true, closes: today.closes, isAllDay};
+    }
+    if (today.closed || (today.opens && today.closes)) {
+        if (!today.closed && today.opens) {
+            const [oh, om] = today.opens.split(':').map(Number);
+            const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+            if (nowMin < oh * 60 + om) {
+                return {isOpen: false, nextOpen: {dayIdx: todayIdx, day: today.day, opens: today.opens}};
+            }
+        }
+        for (let i = 1; i <= 7; i++) {
+            const next = hours[(todayIdx + i) % 7];
+            if (next && !next.closed && next.opens) {
+                return {isOpen: false, nextOpen: {dayIdx: (todayIdx + i) % 7, day: next.day, opens: next.opens}};
+            }
+        }
+        return {isOpen: false};
+    }
+    return {isUnspecified: true};
+}
+
+const initEffectifyStatic = () => {
+    SNTSStaticMainFunction().catch((error) => {
+        console.error("SNTS Static Store Locator failed to initialize", error);
+        setMapMessageStatic("Unable to load map.");
+    });
+};
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initEffectifyStatic);
+} else {
+    initEffectifyStatic();
+}
+
+async function SNTSStaticMainFunction() {
+    shopUrlStatic = window.Shopify?.shop || "";
+    setMapMessageStatic("Loading map...");
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    try {
+        const locatorSettings = await fetch(`${BACKEND_BASE_URL_STATIC}/get_locator_settings?shop_url=${encodeURIComponent(shopUrlStatic)}`, {
+            method: "GET",
+            mode: "cors",
+            headers: { "ngrok-skip-browser-warning": "true" },
+            signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+
+        if (!locatorSettings.ok) {
+            console.warn("Failed to fetch locator settings");
+            setMapMessageStatic("Unable to load map.");
+            return;
+        }
+
+        const response = await locatorSettings.json();
+        settingsStatic = response.result || {};
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === "AbortError") {
+            setMapMessageStatic("Request timed out.");
+        } else {
+            setMapMessageStatic("Unable to load map.");
+        }
+        console.error("Error fetching locator settings", error);
+        return;
+    }
+
+    const shopifyObj = window.Shopify || {};
+    const isThemeEditor = shopifyObj.designMode === true || shopifyObj.visualPreviewMode === true;
+    const isFreePlan = settingsStatic.plan_id === 3;
+
+    const locators = document.querySelectorAll('[data-effectify-store-locator]');
+    if (isThemeEditor) {
+        locators.forEach(el => {
+            el.style.display = 'flex';
+        })
+    } else {
+        if (!isFreePlan && locators.length) {
+            const firstLocator = locators[0];
+            firstLocator.style.display = 'flex';
+        }
+    }
+
+    if (isFreePlan && isThemeEditor) {
+        showUpgradeBanner();
+        const storeLocationsHeader = document.getElementById("storeLocationsHeader-static");
+        const storeLocationsContainer = document.getElementById("storesContainer-static");
+        if (storeLocationsHeader) {
+            storeLocationsHeader.style.opacity = "0.5";
+        }
+        
+        if (storeLocationsContainer) {
+            storeLocationsContainer.style.opacity = "0.5";
+        }
+    }
+
+    if (settingsStatic.store_locations.length === 0) {
+        if (!isFreePlan && isThemeEditor) {
+            showAddStoreLocationsBanner();
+        } else {
+            locators.forEach(element => {
+                element.remove();
+            });
+        }
+        return;
+    }
+
+    applyThemeSettingsStatic();
+    initializeStoreDataStatic();
+    attachSearchHandlerStatic();
+    renderStoresListStatic();
+    setupResponsiveStoresListStatic();
+    updateMapIframeStatic();
+}
+
+function applyThemeSettingsStatic() {
+    const locatorHeader = document.getElementById("locatorHeader-static");
+    const storeLocationsHeader = document.getElementById("storeLocationsHeader-static");
+    const storesList = document.getElementById("storesListContainer-static");
+    const searchResultElement = document.getElementById("searchResultsCount-static");
+
+    if (!locatorHeader || !storesList || !searchResultElement) {
+        return false;
+    }
+
+    const searchInput = document.getElementById("storeSearchInput-static");
+    if (searchInput && settingsStatic.nav_search_placeholder) {
+        searchInput.placeholder = settingsStatic.nav_search_placeholder;
+    }
+
+    const backgroundColor = getColorSettingStatic(settingsStatic.nav_background_color, "f6f6f7");
+    const titleColor = getColorSettingStatic(settingsStatic.nav_title_color, "1e2433");
+    const secondaryColor = getColorSettingStatic(settingsStatic.nav_secondary_text_color, "6d7175");
+
+    storeLocationsHeader.style.backgroundColor = `#${backgroundColor}`;
+    locatorHeader.innerText = settingsStatic.nav_title || "Store locations";
+    locatorHeader.style.color = `#${titleColor}`;
+    storesList.style.backgroundColor = `#${backgroundColor}`;
+    const resizeHandleStatic = document.getElementById("storesResizer-static");
+    if (resizeHandleStatic) resizeHandleStatic.style.backgroundColor = `#${backgroundColor}`;
+    searchResultElement.style.color = `#${secondaryColor}`;
+
+    if (settingsStatic.nav_custom_css) {
+        const styleElement = document.createElement("style");
+        styleElement.type = "text/css";
+        styleElement.innerHTML = settingsStatic.nav_custom_css;
+        document.head.appendChild(styleElement);
+    }
+
+    return true;
+}
+
+function showUpgradeBanner() {
+    document.querySelectorAll('[data-effectify-store-locator]').forEach((el) => {
+        if (el.querySelector('.effectify-warning')) return; 
+        
+        const shopName = window.Shopify?.shop.split('.')[0] || 'admin';
+        const planUrl = `https://admin.shopify.com/store/${shopName}/apps/sticky-navigate-to-store/account-settings`;
+    
+        const warningHTML = `
+          <div class="upgrade-plan-warning">
+            <div class="locator-banner-header">
+                <span class="locator-banner-icons">
+                    <svg viewBox="0 0 20 20" class="locator-icon-svg" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M6.75 8V6.5C6.75 4.70507 8.20507 3.25 10 3.25C11.7949 3.25 13.25 4.70507 13.25 6.5V8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        <rect x="4.75" y="8" width="10.5" height="8.75" rx="1.25" stroke="currentColor" stroke-width="1.5"/>
+                    </svg>
+                </span>
+                <span class="locator-banner-notice">This banner is only visible to you</span>
+            </div>
+            
+            <div class="locator-banner-content">
+                <span class="locator-banner-label">Plan Upgrade Required:</span>
+                <span class="locator-banner-text">You are previewing the Store Locator block. To display it on your live store, please upgrade your plan.</span>
+            </div>
+
+            <div class="locator-banner-footer">
+                <div class="footer-button-container">
+                    <a href="${planUrl}" 
+                        target="_blank" 
+                        class="polaris-btn-primary-dark" 
+                        onclick="event.stopPropagation(); window.open(this.href, '_blank'); return false;">
+                        Upgrade Now
+                    </a>
+                </div>
+                <img src="https://cdn.shopify.com/s/files/1/0937/6428/8833/files/drive-to-us-sticky-navigator.png?v=1773149888" class="drive-to-us-sticky-navigator">
+                &nbsp;&nbsp;&nbsp;
+                <span>Way: Google Maps Store Locator</span>
+            </div>
+        </div>`;
+        
+        el.insertAdjacentHTML('afterbegin', warningHTML);
+    });
+}
+
+function showAddStoreLocationsBanner() {
+    document.querySelectorAll('[data-effectify-store-locator]').forEach((el) => {
+        if (el.querySelector('.effectify-warning')) return; 
+        
+        const warningHTML = `
+          <div class="upgrade-plan-warning">
+            <div class="locator-banner-header">
+                <span class="locator-banner-icons">
+                    <svg viewBox="0 0 20 20" class="locator-icon-svg" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M6.75 8V6.5C6.75 4.70507 8.20507 3.25 10 3.25C11.7949 3.25 13.25 4.70507 13.25 6.5V8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        <rect x="4.75" y="8" width="10.5" height="8.75" rx="1.25" stroke="currentColor" stroke-width="1.5"/>
+                    </svg>
+                </span>
+                <span class="locator-banner-notice">This banner is only visible to you</span>
+            </div>
+
+            <div class="locator-banner-content">
+                <span class="locator-banner-label">Please add at least one store location to use this app block.</span>
+            </div>
+        </div>`;
+        
+        el.style.height = "auto";
+        el.innerHTML = warningHTML;
+    });
+}
+
+function initializeStoreDataStatic() {
+    const locations = Array.isArray(settingsStatic.store_locations) ? settingsStatic.store_locations : [];
+
+    storeLocationsStatic = locations.map((store) => ({
+        ...store,
+        latitude: store.latitude !== undefined && store.latitude !== null && store.latitude !== "" ? Number(store.latitude) : undefined,
+        longitude: store.longitude !== undefined && store.longitude !== null && store.longitude !== "" ? Number(store.longitude) : undefined,
+    }));
+
+    storeIndexMapStatic = new Map();
+    storeCoordinatesStatic = {};
+
+    storeLocationsStatic.forEach((store) => {
+        if (isFinite(store.latitude) && isFinite(store.longitude)) {
+            storeCoordinatesStatic[store.id] = { lat: store.latitude, lng: store.longitude };
+        }
+    });
+
+    const numberingOrderStatic = settingsStatic.nav_sort_alphabetically
+        ? [...storeLocationsStatic].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, {sensitivity: "base"}))
+        : storeLocationsStatic;
+    numberingOrderStatic.forEach((store, index) => {
+        storeIndexMapStatic.set(store.id, index + 1);
+    });
+
+    filteredStoreLocationsStatic = [...storeLocationsStatic];
+
+    if (settingsStatic.nav_expand_default) {
+        storeLocationsStatic.forEach(store => {
+            isExpandedStateStatic[store.id] = true;
+        });
+    }
+}
+
+function updateSearchCountStatic(invisible = false) {
+    const countElement = document.getElementById("searchResultsCount-static");
+    if (!countElement) return;
+    if (invisible) {
+        countElement.innerText = '';
+    } else {
+        countElement.innerText = `${settingsStatic.nav_search_text}: ${filteredStoreLocationsStatic.length}`;
+    }
+}
+
+
+const NEARBY_TEXTStatic = {
+    "en": {
+        "away": "{distance} away",
+        "nearYou": "Near your location",
+        "pill": "Show nearest stores to your location",
+        "icon": "Use my current location",
+        "clear": "Clear location sorting",
+        "keepTyping": "Keep typing a store name or postcode...",
+        "searching": "Searching nearby stores...",
+        "none": "No stores found.",
+        "unavailable": "Location isn't available here. Try your postcode.",
+        "blocked": "Location access was blocked. Try your postcode.",
+        "failed": "Couldn't get your location. Try your postcode.",
+        "noStores": "No store locations to sort yet."
+    },
+    "es": {
+        "away": "a {distance}",
+        "nearYou": "Cerca de tu ubicación",
+        "pill": "Mostrar las tiendas más cercanas a tu ubicación",
+        "icon": "Usar mi ubicación actual",
+        "clear": "Quitar orden por ubicación",
+        "keepTyping": "Sigue escribiendo un nombre de tienda o código postal...",
+        "searching": "Buscando tiendas cercanas...",
+        "none": "No se encontraron tiendas.",
+        "unavailable": "La ubicación no está disponible aquí. Prueba con tu código postal.",
+        "blocked": "El acceso a la ubicación está bloqueado. Prueba con tu código postal.",
+        "failed": "No pudimos obtener tu ubicación. Prueba con tu código postal.",
+        "noStores": "Aún no hay tiendas que ordenar."
+    },
+    "fr": {
+        "away": "à {distance}",
+        "nearYou": "Près de votre position",
+        "pill": "Afficher les magasins les plus proches de votre position",
+        "icon": "Utiliser ma position actuelle",
+        "clear": "Effacer le tri par position",
+        "keepTyping": "Continuez à saisir un nom de magasin ou un code postal...",
+        "searching": "Recherche des magasins à proximité...",
+        "none": "Aucun magasin trouvé.",
+        "unavailable": "La localisation n'est pas disponible ici. Essayez votre code postal.",
+        "blocked": "L'accès à la position est bloqué. Essayez votre code postal.",
+        "failed": "Impossible d'obtenir votre position. Essayez votre code postal.",
+        "noStores": "Aucun magasin à trier pour le moment."
+    },
+    "de": {
+        "away": "{distance} entfernt",
+        "nearYou": "In der Nähe Ihres Standorts",
+        "pill": "Nächstgelegene Geschäfte zu Ihrem Standort anzeigen",
+        "icon": "Meinen aktuellen Standort verwenden",
+        "clear": "Standortsortierung entfernen",
+        "keepTyping": "Geben Sie weiter einen Geschäftsnamen oder eine Postleitzahl ein...",
+        "searching": "Geschäfte in der Nähe werden gesucht...",
+        "none": "Keine Geschäfte gefunden.",
+        "unavailable": "Standort hier nicht verfügbar. Versuchen Sie es mit Ihrer Postleitzahl.",
+        "blocked": "Der Standortzugriff wurde blockiert. Versuchen Sie es mit Ihrer Postleitzahl.",
+        "failed": "Ihr Standort konnte nicht ermittelt werden. Versuchen Sie es mit Ihrer Postleitzahl.",
+        "noStores": "Noch keine Geschäfte zum Sortieren."
+    },
+    "zh-CN": {
+        "away": "距离 {distance}",
+        "nearYou": "离您的位置最近",
+        "pill": "显示离您位置最近的门店",
+        "icon": "使用我当前的位置",
+        "clear": "清除位置排序",
+        "keepTyping": "请继续输入门店名称或邮政编码...",
+        "searching": "正在搜索附近的门店...",
+        "none": "未找到门店。",
+        "unavailable": "此处无法使用定位。请尝试输入邮政编码。",
+        "blocked": "位置访问已被阻止。请尝试输入邮政编码。",
+        "failed": "无法获取您的位置。请尝试输入邮政编码。",
+        "noStores": "暂无可排序的门店。"
+    },
+    "it": {
+        "away": "a {distance}",
+        "nearYou": "Vicino alla tua posizione",
+        "pill": "Mostra i negozi più vicini alla tua posizione",
+        "icon": "Usa la mia posizione attuale",
+        "clear": "Rimuovi ordinamento per posizione",
+        "keepTyping": "Continua a scrivere un nome di negozio o un CAP...",
+        "searching": "Ricerca dei negozi nelle vicinanze...",
+        "none": "Nessun negozio trovato.",
+        "unavailable": "La posizione non è disponibile qui. Prova con il tuo CAP.",
+        "blocked": "L'accesso alla posizione è bloccato. Prova con il tuo CAP.",
+        "failed": "Impossibile ottenere la tua posizione. Prova con il tuo CAP.",
+        "noStores": "Ancora nessun negozio da ordinare."
+    },
+    "nl": {
+        "away": "{distance} verwijderd",
+        "nearYou": "In de buurt van je locatie",
+        "pill": "Toon de dichtstbijzijnde winkels bij jouw locatie",
+        "icon": "Mijn huidige locatie gebruiken",
+        "clear": "Locatiesortering wissen",
+        "keepTyping": "Blijf typen: een winkelnaam of postcode...",
+        "searching": "Winkels in de buurt zoeken...",
+        "none": "Geen winkels gevonden.",
+        "unavailable": "Locatie is hier niet beschikbaar. Probeer je postcode.",
+        "blocked": "Toegang tot je locatie is geblokkeerd. Probeer je postcode.",
+        "failed": "Je locatie kon niet worden opgehaald. Probeer je postcode.",
+        "noStores": "Nog geen winkels om te sorteren."
+    },
+    "pt-BR": {
+        "away": "a {distance}",
+        "nearYou": "Perto da sua localização",
+        "pill": "Mostrar as lojas mais próximas da sua localização",
+        "icon": "Usar minha localização atual",
+        "clear": "Limpar ordenação por localização",
+        "keepTyping": "Continue digitando o nome de uma loja ou um CEP...",
+        "searching": "Procurando lojas próximas...",
+        "none": "Nenhuma loja encontrada.",
+        "unavailable": "A localização não está disponível aqui. Tente seu CEP.",
+        "blocked": "O acesso à localização foi bloqueado. Tente seu CEP.",
+        "failed": "Não foi possível obter sua localização. Tente seu CEP.",
+        "noStores": "Ainda não há lojas para ordenar."
+    },
+    "tr": {
+        "away": "{distance} uzaklıkta",
+        "nearYou": "Konumunuza yakın",
+        "pill": "Konumunuza en yakın mağazaları göster",
+        "icon": "Mevcut konumumu kullan",
+        "clear": "Konuma göre sıralamayı temizle",
+        "keepTyping": "Mağaza adı veya posta kodu yazmaya devam edin...",
+        "searching": "Yakındaki mağazalar aranıyor...",
+        "none": "Mağaza bulunamadı.",
+        "unavailable": "Konum burada kullanılamıyor. Posta kodunuzu deneyin.",
+        "blocked": "Konum erişimi engellendi. Posta kodunuzu deneyin.",
+        "failed": "Konumunuz alınamadı. Posta kodunuzu deneyin.",
+        "noStores": "Henüz sıralanacak mağaza yok."
+    },
+    "ja": {
+        "away": "{distance} の距離",
+        "nearYou": "現在地の近く",
+        "pill": "現在地に近い店舗を表示",
+        "icon": "現在地を使用",
+        "clear": "現在地での並べ替えを解除",
+        "keepTyping": "店舗名または郵便番号を入力し続けてください...",
+        "searching": "近くの店舗を検索中...",
+        "none": "店舗が見つかりません。",
+        "unavailable": "ここでは位置情報を利用できません。郵便番号をお試しください。",
+        "blocked": "位置情報へのアクセスがブロックされています。郵便番号をお試しください。",
+        "failed": "現在地を取得できませんでした。郵便番号をお試しください。",
+        "noStores": "並べ替える店舗がまだありません。"
+    },
+    "da": {
+        "away": "{distance} væk",
+        "nearYou": "Tæt på din placering",
+        "pill": "Vis de nærmeste butikker til din placering",
+        "icon": "Brug min aktuelle placering",
+        "clear": "Ryd sortering efter placering",
+        "keepTyping": "Skriv videre: et butiksnavn eller postnummer...",
+        "searching": "Søger efter butikker i nærheden...",
+        "none": "Ingen butikker fundet.",
+        "unavailable": "Placering er ikke tilgængelig her. Prøv dit postnummer.",
+        "blocked": "Adgang til placering er blokeret. Prøv dit postnummer.",
+        "failed": "Vi kunne ikke finde din placering. Prøv dit postnummer.",
+        "noStores": "Ingen butikker at sortere endnu."
+    }
+};
+
+function nearbyTextStatic(key, vars) {
+    const locale = String((window.Shopify && window.Shopify.locale) || document.documentElement.lang || "en");
+    const base = locale.split("-")[0];
+    const table = NEARBY_TEXTStatic[locale] || NEARBY_TEXTStatic[base] || (base === "zh" ? NEARBY_TEXTStatic["zh-CN"] : null) || NEARBY_TEXTStatic.en;
+    const text = table[key] || NEARBY_TEXTStatic.en[key];
+    return vars && vars.distance !== undefined ? text.replace("{distance}", vars.distance) : text;
+}
+
+const NEARBY_RADIUS_KMStatic = 10;
+let nearbySearchTokenStatic = 0;
+let nearbySearchTimerStatic = null;
+let nearbyDistancesStatic = {};
+let nearbySearchPendingStatic = false;
+let nearMeActiveStatic = false;
+let nearMeNoteTimerStatic = null;
+
+function distanceKmStatic(lat1, lng1, lat2, lng2) {
+    const toRad = (deg) => deg * Math.PI / 180;
+    const a = Math.sin(toRad(lat2 - lat1) / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(toRad(lng2 - lng1) / 2) ** 2;
+    return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function formatDistanceStatic(km) {
+    return km < 1 ? `${Math.round(km * 1000)} m` : `${km < 10 ? km.toFixed(1) : Math.round(km)} km`;
+}
+
+async function geocodeSearchQueryStatic(query) {
+    try {
+        const response = await fetch(`${BACKEND_BASE_URL_STATIC}/geocode_search?shop_url=${encodeURIComponent(shopUrlStatic)}&q=${encodeURIComponent(query)}`, {
+            method: "GET",
+            mode: "cors",
+            headers: {"ngrok-skip-browser-warning": "true"},
+        });
+        if (!response.ok) return null;
+        const data = await response.json();
+        const origin = data && data.result;
+        return origin && isFinite(origin.latitude) && isFinite(origin.longitude) ? origin : null;
+    } catch (error) {
+        return null;
+    }
+}
+
+function applyNearbyOriginStatic(origin, textMatches, labelAll) {
+    const ranked = storeLocationsStatic
+        .filter((store) => isFinite(store.latitude) && isFinite(store.longitude))
+        .map((store) => ({store, km: distanceKmStatic(origin.latitude, origin.longitude, store.latitude, store.longitude)}))
+        .sort((a, b) => a.km - b.km);
+    if (ranked.length === 0) return false;
+
+    let shown = labelAll ? ranked : ranked.filter((entry) => entry.km <= NEARBY_RADIUS_KMStatic);
+    if (shown.length === 0) shown = ranked.slice(0, 1);
+
+    const shownIds = new Set(shown.map((entry) => entry.store.id));
+    nearbyDistancesStatic = {};
+    shown.forEach((entry) => { nearbyDistancesStatic[entry.store.id] = entry.km; });
+    filteredStoreLocationsStatic = [...shown.map((entry) => entry.store), ...textMatches.filter((store) => !shownIds.has(store.id))];
+    selectedStoreIdStatic = shown[0].store.id;
+
+    renderStoresListStatic();
+    updateSearchCountStatic(labelAll);
+    updateMapIframeStatic();
+    return true;
+}
+
+function scheduleNearbySearchStatic(value, textMatches) {
+    clearTimeout(nearbySearchTimerStatic);
+    const token = ++nearbySearchTokenStatic;
+    nearbyDistancesStatic = {};
+    nearbySearchPendingStatic = false;
+    if (value.length < 3) return;
+
+    nearbySearchPendingStatic = textMatches.length === 0;
+    if (nearbySearchPendingStatic) renderStoresListStatic();
+
+    nearbySearchTimerStatic = setTimeout(async () => {
+        const origin = await geocodeSearchQueryStatic(value);
+        if (token !== nearbySearchTokenStatic) return;
+        nearbySearchPendingStatic = false;
+        const applied = origin ? applyNearbyOriginStatic(origin, textMatches, false) : false;
+        if (!applied && textMatches.length === 0) renderStoresListStatic();
+    }, 500);
+}
+
+function setNearMeStatusStatic(text, isNote, hideAfterMs) {
+    const status = document.getElementById("nearMeStatus-static");
+    const label = document.getElementById("nearMeText-static");
+    if (!status || !label) return;
+    clearTimeout(nearMeNoteTimerStatic);
+    if (!text) {
+        status.hidden = true;
+        return;
+    }
+    label.textContent = text;
+    status.classList.toggle("is-note", Boolean(isNote));
+    status.hidden = false;
+    if (hideAfterMs) nearMeNoteTimerStatic = setTimeout(() => { status.hidden = true; }, hideAfterMs);
+}
+
+function clearNearMeStatic(restoreList) {
+    setNearMeStatusStatic("");
+    const pill = document.getElementById("nearMePill-static");
+    if (pill) pill.hidden = false;
+    if (nearMeActiveStatic && restoreList) {
+        nearbyDistancesStatic = {};
+        filteredStoreLocationsStatic = [...storeLocationsStatic];
+        selectedStoreIdStatic = null;
+        renderStoresListStatic();
+        updateSearchCountStatic(true);
+        updateMapIframeStatic();
+    }
+    nearMeActiveStatic = false;
+}
+
+function useMyLocationStatic() {
+    const button = document.getElementById("useLocationButton-static");
+    const pill = document.getElementById("nearMePill-static");
+    if (!navigator.geolocation) {
+        setNearMeStatusStatic(nearbyTextStatic("unavailable"), true, 6000);
+        return;
+    }
+    if (button) button.classList.add("is-loading");
+    if (pill) pill.classList.add("is-loading");
+    navigator.geolocation.getCurrentPosition((position) => {
+        if (button) button.classList.remove("is-loading");
+        if (pill) pill.classList.remove("is-loading");
+        const input = document.getElementById("storeSearchInput-static");
+        if (input) input.value = "";
+        clearTimeout(nearbySearchTimerStatic);
+        nearbySearchTokenStatic++;
+        nearbySearchPendingStatic = false;
+        const applied = applyNearbyOriginStatic({latitude: position.coords.latitude, longitude: position.coords.longitude}, [...storeLocationsStatic], true);
+        if (applied) {
+            nearMeActiveStatic = true;
+            if (pill) pill.hidden = true;
+            setNearMeStatusStatic(nearbyTextStatic("nearYou"), false);
+        } else {
+            setNearMeStatusStatic(nearbyTextStatic("noStores"), true, 6000);
+        }
+    }, (error) => {
+        if (button) button.classList.remove("is-loading");
+        if (pill) pill.classList.remove("is-loading");
+        setNearMeStatusStatic(error && error.code === 1 ? nearbyTextStatic("blocked") : nearbyTextStatic("failed"), true, 6000);
+    }, {timeout: 10000, maximumAge: 300000});
+}
+
+function attachNearMeHandlerStatic() {
+    const button = document.getElementById("useLocationButton-static");
+    const clear = document.getElementById("nearMeClear-static");
+    const pillLabel = document.getElementById("nearMePill-static");
+    if (button) {
+        button.setAttribute("aria-label", nearbyTextStatic("icon"));
+        button.setAttribute("title", nearbyTextStatic("icon"));
+    }
+    if (clear) clear.setAttribute("aria-label", nearbyTextStatic("clear"));
+    if (pillLabel) {
+        pillLabel.setAttribute("aria-label", nearbyTextStatic("pill"));
+        const pillText = pillLabel.querySelector("span");
+        if (pillText) pillText.textContent = nearbyTextStatic("pill");
+    }
+    if (button) button.addEventListener("click", useMyLocationStatic);
+    const pill = document.getElementById("nearMePill-static");
+    if (pill) pill.addEventListener("click", useMyLocationStatic);
+    if (clear) clear.addEventListener("click", () => clearNearMeStatic(true));
+}
+
+function attachResizerHandlerStatic() {
+    const handle = document.getElementById("storesResizer-static");
+    const content = handle ? handle.closest(".store-locator-content") : null;
+    if (!handle || !content) return;
+    const list = content.querySelector(".stores-list-container");
+    const map = content.querySelector(".store-map-container");
+    if (!list || !map) return;
+
+    const MIN_MAP_H = 120, MIN_LIST_H = 170, MIN_LIST_W = 200, MIN_MAP_W = 220;
+    const stacked = () => (typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 768px)").matches : window.innerWidth <= 768);
+    const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+    const sync = () => handle.setAttribute("aria-orientation", stacked() ? "horizontal" : "vertical");
+    sync();
+
+    const apply = (size) => {
+        if (stacked()) {
+            const max = content.clientHeight - handle.offsetHeight - MIN_LIST_H;
+            const height = clamp(size, MIN_MAP_H, Math.max(MIN_MAP_H, max));
+            content.style.setProperty("--snts-map-h", height + "px");
+            handle.setAttribute("aria-valuenow", String(Math.round(height)));
+        } else {
+            const max = content.clientWidth - handle.offsetWidth - MIN_MAP_W;
+            const width = clamp(size, MIN_LIST_W, Math.max(MIN_LIST_W, max));
+            content.style.setProperty("--snts-list-w", width + "px");
+            handle.setAttribute("aria-valuenow", String(Math.round(width)));
+        }
+    };
+
+    let drag = null;
+    handle.addEventListener("pointerdown", (event) => {
+        if (event.button !== undefined && event.button !== 0) return;
+        sync();
+        drag = stacked()
+            ? {axis: "y", start: event.clientY, size: map.getBoundingClientRect().height}
+            : {axis: "x", start: event.clientX, size: list.getBoundingClientRect().width};
+        handle.setPointerCapture(event.pointerId);
+        handle.classList.add("is-dragging");
+        document.body.classList.add("snts-resizing");
+        event.preventDefault();
+    });
+    handle.addEventListener("pointermove", (event) => {
+        if (!drag) return;
+        apply(drag.size + (drag.axis === "y" ? event.clientY - drag.start : event.clientX - drag.start));
+    });
+    const endDrag = (event) => {
+        if (!drag) return;
+        drag = null;
+        handle.classList.remove("is-dragging");
+        document.body.classList.remove("snts-resizing");
+        try { handle.releasePointerCapture(event.pointerId); } catch (error) {}
+    };
+    handle.addEventListener("pointerup", endDrag);
+    handle.addEventListener("pointercancel", endDrag);
+
+    handle.addEventListener("keydown", (event) => {
+        const isStacked = stacked();
+        const shrink = isStacked ? "ArrowUp" : "ArrowLeft";
+        const grow = isStacked ? "ArrowDown" : "ArrowRight";
+        if (![shrink, grow, "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        sync();
+        const current = isStacked ? map.getBoundingClientRect().height : list.getBoundingClientRect().width;
+        const step = event.shiftKey ? 60 : 24;
+        if (event.key === "Home") apply(0);
+        else if (event.key === "End") apply(100000);
+        else apply(current + (event.key === grow ? step : -step));
+    });
+
+    handle.addEventListener("dblclick", () => {
+        content.style.removeProperty("--snts-map-h");
+        content.style.removeProperty("--snts-list-w");
+    });
+}
+
+function typedLengthStatic() {
+    const input = document.getElementById("storeSearchInput-static");
+    return input ? input.value.trim().length : 0;
+}
+
+function attachSearchHandlerStatic() {
+    const searchInput = document.getElementById("storeSearchInput-static");
+    if (!searchInput) return;
+
+    attachNearMeHandlerStatic();
+    attachResizerHandlerStatic();
+
+    searchInput.addEventListener("input", (event) => {
+        clearNearMeStatic(false);
+        updateSearchCountStatic(true);
+        const value = (event.target.value || "").trim().toLowerCase();
+        const prevSelected = selectedStoreIdStatic;
+
+        if (!value) {
+            filteredStoreLocationsStatic = [...storeLocationsStatic];
+        } else {
+            filteredStoreLocationsStatic = storeLocationsStatic.filter((store) => {
+                const name = (store.name || "").toLowerCase();
+                const address = (store.address || "").toLowerCase();
+                const compactValue = value.replace(/[\s\-]+/g, "");
+                return name.includes(value) || address.includes(value) ||
+                    (compactValue && (name + address).replace(/[\s\-]+/g, "").includes(compactValue));
+            });
+        }
+
+        if (prevSelected && !filteredStoreLocationsStatic.some((store) => store.id === prevSelected)) {
+            selectedStoreIdStatic = null;
+        }
+
+        scheduleNearbySearchStatic(value, filteredStoreLocationsStatic);
+        renderStoresListStatic();
+        if (value) updateSearchCountStatic();
+        updateMapIframeStatic();
+    });
+}
+
+function renderStoresListStatic() {
+    const listElement = document.getElementById("storeLocationsList-static");
+    if (!listElement) return;
+
+    if (filteredStoreLocationsStatic.length === 0) {
+        listElement.innerHTML = `<div class="store-item" style="border-bottom: none; cursor: default;">
+      <p class="store-address font-family" style="margin: 0; color: #6d7175;">${nearbySearchPendingStatic ? nearbyTextStatic("searching") : (typedLengthStatic() > 0 && typedLengthStatic() < 3 ? nearbyTextStatic("keepTyping") : nearbyTextStatic("none"))}</p>
+    </div>`;
+        updateMapIframeStatic();
+        return;
+    }
+
+    const titleColor = getColorSettingStatic(settingsStatic.nav_title_color, "1e2433");
+    const secondaryColor = getColorSettingStatic(settingsStatic.nav_secondary_text_color, "6d7175");
+    const buttonColor = getColorSettingStatic(settingsStatic.nav_button_color, "007BDF");
+    const buttonText = settingsStatic.nav_button_text || "Get direction";
+    const downChevronColor = getColorSettingStatic(settingsStatic.nav_down_chevron_color, "6d7175");
+    const listIconColor = getColorSettingStatic(settingsStatic.nav_list_icon_color, "6d7175");
+    const openStatusText = settingsStatic.nav_open_status_text || "Open";
+    const closedStatusText = settingsStatic.nav_closed_status_text || "Closed";
+    const openingTimePrefix = settingsStatic.nav_opening_time_prefix || "Opens at";
+    const closingTimePrefix = settingsStatic.nav_closing_time_prefix || "Closes at";
+    const closedAllDayText = settingsStatic.nav_closed_all_day_text || "Closed";
+    const open24HoursText = settingsStatic.nav_open_24_hours_text || "Open 24 hours";
+    const dayNames = [
+        settingsStatic.nav_sunday_text || "Sunday",
+        settingsStatic.nav_monday_text || "Monday",
+        settingsStatic.nav_tuesday_text || "Tuesday",
+        settingsStatic.nav_wednesday_text || "Wednesday",
+        settingsStatic.nav_thursday_text || "Thursday",
+        settingsStatic.nav_friday_text || "Friday",
+        settingsStatic.nav_saturday_text || "Saturday",
+    ];
+
+    const hideNumbers = Boolean(settingsStatic.nav_hide_store_numbers);
+    const displayStoreLocations = settingsStatic.nav_sort_alphabetically && Object.keys(nearbyDistancesStatic).length === 0
+        ? [...filteredStoreLocationsStatic].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, {sensitivity: "base"}))
+        : filteredStoreLocationsStatic;
+
+    const itemsHtml = displayStoreLocations
+        .map((store) => {
+            const storeId = store.id;
+            const storeNumber = getStoreNumberStatic(storeId);
+            const isSelected = selectedStoreIdStatic === storeId;
+            const isExpanded = Boolean(isExpandedStateStatic[storeId]);
+            const hasPhone = Boolean(store.phone);
+            const hasImage = Array.isArray(store.image) && store.image.length > 0;
+            const hasHours = store.displayHours !== false && Array.isArray(store.hours) && store.hours.length > 0;
+            const hasDetails = hasPhone || hasImage || hasHours;
+
+            const addressHtml = store.address ? `<div class="store-address-container">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" style="min-width: 20px; height: 20px; fill: #${listIconColor};">
+              <path fill-rule="evenodd" d="M14.25 16h-3.077l.07-.061a17.427 17.427 0 0 0 1.707-1.758c1.224-1.46 2.55-3.574 2.55-5.954 0-3.167-2.328-5.477-5.5-5.477s-5.5 2.31-5.5 5.477c0 2.38 1.326 4.495 2.55 5.954a17.426 17.426 0 0 0 1.708 1.758l.069.061h-3.077a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5Zm-4.25-5.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" />
+            </svg>
+            <p class="store-address font-family" style="color: #${secondaryColor};" id="storeAddress">
+              ${escapeHtmlStatic(store.address)}
+            </p>
+          </div>` : "";
+
+            const phoneHtml = hasPhone ? `<div class="phone-section">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" style="width: 20px; height: 20px;">
+                <path fill-rule="evenodd" d="M6.75 4.5c-1.283 0-2.213 1.025-2.044 2.127.384 2.498 1.296 4.459 2.707 5.89 1.41 1.43 3.373 2.389 5.96 2.786 1.101.17 2.126-.76 2.126-2.044v-.727a.25.25 0 0 0-.187-.242l-1.9-.498a.25.25 0 0 0-.182.022l-1.067.576c-.69.373-1.638.492-2.422-.056a8.678 8.678 0 0 1-2.071-2.09c-.542-.787-.423-1.735-.045-2.428l.57-1.047a.252.252 0 0 0 .022-.182l-.498-1.9a.25.25 0 0 0-.242-.187h-.726Zm-3.526 2.355c-.334-2.174 1.497-3.856 3.527-3.855h.726a1.75 1.75 0 0 1 1.693 1.306l.498 1.9c.113.43.058.885-.153 1.276l-.001.002-.572 1.05c-.191.351-.169.668-.036.86a7.184 7.184 0 0 0 1.694 1.71c.187.13.498.156.85-.034l1.067-.576a1.75 1.75 0 0 1 1.276-.153l1.9.498a1.75 1.75 0 0 1 1.306 1.693v.727c0 2.03-1.68 3.86-3.854 3.527-2.838-.436-5.12-1.511-6.8-3.216-1.68-1.703-2.701-3.978-3.121-6.715Z" />
+              </svg>
+              <a href="tel:${escapeHtmlStatic(store.phone)}" class="phone-number font-family" style="color: #${secondaryColor};">
+                ${escapeHtmlStatic(store.phone)}
+              </a>
+            </div>` : "";
+
+            const imageUrl = hasImage ? escapeHtmlStatic(store.image[0]) : "";
+            const imageHtml = hasImage ? `<div class="store-image-section">
+              <img src="${imageUrl}" alt="${escapeHtmlStatic(store.name)}" class="store-image" />
+           </div>` : "";
+
+            const hoursStatus = hasHours ? getTodayHoursStatusStatic(store.hours) : null;
+            const hoursStatusHtml = hoursStatus ? `<div class="font-family" style="font-size:12px;margin-top:4px;line-height:1.5;">
+              ${hoursStatus.isUnspecified
+                ? `<span style="font-weight:600;color:#6d7175;">--</span>`
+                : `<span style="font-weight:600;color:${hoursStatus.isOpen ? "#008060" : "#D82C0D"};">${hoursStatus.isOpen ? (hoursStatus.isAllDay ? escapeHtmlStatic(open24HoursText) : escapeHtmlStatic(openStatusText)) : escapeHtmlStatic(closedStatusText)}</span>
+              ${hoursStatus.isOpen
+                ? (hoursStatus.isAllDay ? '' : `<span style="color:#${secondaryColor};"> · ${escapeHtmlStatic(closingTimePrefix)} ${escapeHtmlStatic(hoursStatus.closes)}</span>`)
+                : hoursStatus.nextOpen
+                  ? `<span style="color:#${secondaryColor};"> · ${escapeHtmlStatic(openingTimePrefix)} ${escapeHtmlStatic(dayNames[hoursStatus.nextOpen.dayIdx] || hoursStatus.nextOpen.day)} ${escapeHtmlStatic(hoursStatus.nextOpen.opens)}</span>`
+                  : ""}`}
+            </div>` : "";
+
+            const hoursScheduleHtml = hasHours ? `<div style="margin-top:8px;margin-bottom:4px;">
+              ${store.hours.map(function(d, idx) {
+                  const isToday = idx === new Date().getDay();
+                  const hoursText = d.closed ? escapeHtmlStatic(closedAllDayText) : (d.opens && d.closes ? (d.opens === '00:00' && d.closes === '00:00' ? escapeHtmlStatic(open24HoursText) : escapeHtmlStatic(d.opens) + ' – ' + escapeHtmlStatic(d.closes)) : '--');
+                  return '<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:12px;font-weight:' + (isToday ? '600' : '400') + ';color:#' + secondaryColor + ';">'
+                      + '<span>' + escapeHtmlStatic(dayNames[idx]) + '</span>'
+                      + '<span>' + hoursText + '</span>'
+                      + '</div>';
+              }).join("")}
+            </div>` : "";
+
+            const chevronHtml = hasDetails ? `<span role="button" tabindex="0" class="header-icon-button" aria-label="Store details" aria-expanded="${isExpanded}" aria-controls="store-details-static-${escapeHtmlStatic(storeId)}" onclick="EffectifyStaticLocator.toggleStoreDetailsStatic(event, ${jsArgStatic(storeId)})">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" class="chevron-icon" style="stroke: #${downChevronColor}; transform: ${isExpanded ? "rotate(180deg)" : "rotate(0deg)"};">
+                <path fill-rule="evenodd" d="M5.72 8.47a.75.75 0 0 1 1.06 0l3.47 3.47 3.47-3.47a.75.75 0 1 1 1.06 1.06l-4 4a.75.75 0 0 1-1.06 0l-4-4a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+              </svg>
+           </span>` : "";
+
+            const detailsHtml = hasDetails ? `<div id="store-details-static-${escapeHtmlStatic(storeId)}" class="store-details" style="display: ${isExpanded ? "block" : "none"};">
+              ${hoursScheduleHtml}
+              ${phoneHtml}
+              ${imageHtml}
+           </div>` : "";
+
+            return `<div class="store-item${isSelected ? " selected" : ""}" onclick="EffectifyStaticLocator.handleStoreItemClickStatic(${jsArgStatic(storeId)})" data-store-id="${escapeHtmlStatic(storeId)}">
+                <div class="store-header">
+                  <div class="store-info">
+                    <div class="store-numbered-name">
+                      <h3 class="store-name font-family" style="color: #${titleColor};">
+                        ${hideNumbers ? '' : `${storeNumber}. `}${escapeHtmlStatic(store.name)}
+                      </h3>
+                    </div>
+                    ${addressHtml}
+                    ${nearbyDistancesStatic[storeId] !== undefined ? `<div class="font-family" style="font-size:12px;margin-top:4px;color:#${secondaryColor};">${nearbyTextStatic("away", {distance: formatDistanceStatic(nearbyDistancesStatic[storeId])})}</div>` : ""}
+                    ${hoursStatusHtml}
+                  </div>
+                  ${chevronHtml}
+                </div>
+                ${detailsHtml}
+                <div class="direction-button-container">
+                  <span role="button" tabindex="0" class="get-direction-button" onclick="EffectifyStaticLocator.handleDirectionStatic(event, ${jsArgStatic(storeId)})" style="border-color: #${buttonColor};">
+                    <span style="color: #${buttonColor};">${escapeHtmlStatic(buttonText)}</span>
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="direction-icon" style="stroke: #${buttonColor}; transform: rotate(315deg); width: 15px;">
+                      <path fill-rule="evenodd" d="m5.008 9.61-2.01-4.75c-.354-.838.506-1.676 1.336-1.3l12.163 5.53a1 1 0 0 1 0 1.82l-12.163 5.53c-.83.376-1.69-.462-1.335-1.3l2.01-4.75a1 1 0 0 0 0-.78Zm1.382-.584-1.51-3.57 9.995 4.544-9.995 4.543 1.51-3.569c.03-.074.058-.148.082-.224h3.778a.75.75 0 0 0 0-1.5h-3.778a2.5 2.5 0 0 0-.082-.224Z" clip-rule="evenodd" />
+                    </svg>
+                  </span>
+                </div>
+              </div>`;
+        })
+        .join("");
+
+    listElement.innerHTML = itemsHtml;
+}
+
+function selectStoreFromMapStatic(rawStoreId) {
+    const store = storeLocationsStatic.find((candidate) => String(candidate.id) === String(rawStoreId));
+    if (!store) return;
+    if (!filteredStoreLocationsStatic.some((candidate) => candidate.id === store.id)) {
+        const input = document.getElementById("storeSearchInput-static");
+        if (input) input.value = "";
+        clearNearMeStatic(false);
+        nearbySearchTokenStatic++;
+        nearbySearchPendingStatic = false;
+        nearbyDistancesStatic = {};
+        filteredStoreLocationsStatic = [...storeLocationsStatic];
+    }
+    selectedStoreIdStatic = store.id;
+    isExpandedStateStatic[store.id] = true;
+    renderStoresListStatic();
+    updateSearchCountStatic(true);
+    const row = document.querySelector(`#storeLocationsList-static .store-item[data-store-id="${CSS.escape(String(store.id))}"]`);
+    if (row) {
+        const tall = row.offsetHeight > (row.parentElement ? row.parentElement.clientHeight : Infinity);
+        row.scrollIntoView({block: tall ? "start" : "nearest", behavior: "smooth"});
+    }
+}
+
+function handleStoreItemClickStatic(storeId) {
+    isExpandedStateStatic[storeId] = !isExpandedStateStatic[storeId];
+    selectedStoreIdStatic = selectedStoreIdStatic === storeId ? null : storeId;
+    renderStoresListStatic();
+    updateMapIframeStatic();
+}
+
+function toggleStoreDetailsStatic(event, storeId) {
+    event.stopPropagation();
+    isExpandedStateStatic[storeId] = !isExpandedStateStatic[storeId];
+    renderStoresListStatic();
+}
+
+function handleDirectionStatic(event, storeId) {
+    if (event && event.stopPropagation) event.stopPropagation();
+
+    const store = storeLocationsStatic.find(loc => loc.id === storeId);
+    if (!store) return;
+
+    const link = safeLinkUrlStatic(store.website) || safeLinkUrlStatic(store.url);
+    if (link) {
+        window.open(link, "_blank");
+    }
+
+    fetch(`${BACKEND_BASE_URL_STATIC}/update_store_location_click`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ shop_url: shopUrlStatic, store_id: storeId }),
+    }).catch(e => console.warn(e));
+}
+
+function updateMapIframeStatic() {
+    const locator = document.querySelector('[data-effectify-store-locator]:not([data-is-duplicate])');
+    const sectionId = locator ? locator.dataset.sectionId : null;
+
+    if (!sectionId) return;
+
+    const iframeStatic = document.getElementById(`google-map-iframe-static-${sectionId}`);
+    if (!iframeStatic) return;
+
+    const storesWithCoordinates = filteredStoreLocationsStatic.filter((store) => isFinite(store.latitude) && isFinite(store.longitude));
+
+    if (!shopUrlStatic) {
+        setMapMessageStatic("Missing shop information.");
+        return;
+    }
+
+    if (storesWithCoordinates.length === 0) {
+        if (nearbySearchPendingStatic) return;
+        if (iframeStatic.dataset.baseSrc) return;
+        setMapMessageStatic(filteredStoreLocationsStatic.length === 0 ? "No stores found." : "No store coordinates available.");
+        return;
+    }
+
+    hideMapMessageStatic();
+    iframeStatic.style.display = "block";
+
+    const baseSrcStatic = `${BACKEND_BASE_URL_STATIC}/get_map?shop_url=${encodeURIComponent(shopUrlStatic)}`;
+
+    if (iframeStatic.dataset.baseSrc === baseSrcStatic) {
+        if (mapIframeReadyStatic) {
+            sendSelectedStoreToIframeStatic(iframeStatic);
+        } else {
+            hasPendingMapSelectionStatic = true;
+        }
+        return;
+    }
+
+    const paramsStatic = new URLSearchParams();
+    paramsStatic.set("shop_url", shopUrlStatic);
+    if (selectedStoreIdStatic) {
+        paramsStatic.set("selected_store_id", String(selectedStoreIdStatic));
+    }
+
+    mapIframeReadyStatic = false;
+    hasPendingMapSelectionStatic = false;
+    iframeStatic.dataset.baseSrc = baseSrcStatic;
+    iframeStatic.src = `${BACKEND_BASE_URL_STATIC}/get_map?${paramsStatic.toString()}`;
+}
+
+function setMapMessageStatic(message) {
+    const iframe = document.getElementById("google-map-iframe-static");
+    const messageElement = document.getElementById("mapIframeMessage-static");
+
+    if (iframe) {
+        iframe.style.display = "none";
+        iframe.dataset.baseSrc = "";
+        iframe.removeAttribute("src");
+        mapIframeReadyStatic = false;
+        hasPendingMapSelectionStatic = false;
+    }
+
+    if (messageElement) {
+        messageElement.style.display = "flex";
+        messageElement.textContent = message;
+    }
+}
+
+function hideMapMessageStatic() {
+    const messageElement = document.getElementById("mapIframeMessage-static");
+    if (messageElement) {
+        messageElement.style.display = "none";
+        messageElement.textContent = "";
+    }
+}
+
+function getStoreNumberStatic(storeId) {
+    return storeIndexMapStatic.get(storeId) || 0;
+}
+
+function escapeHtmlStatic(value) {
+    if (value === null || value === undefined) return "";
+    return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function jsArgStatic(value) {
+    return escapeHtmlStatic(value === undefined ? "undefined" : JSON.stringify(value));
+}
+
+function safeLinkUrlStatic(value) {
+    if (!value) return "";
+    try {
+        const url = new URL(String(value).trim(), window.location.href);
+        return ["http:", "https:", "mailto:", "tel:"].includes(url.protocol) ? String(value) : "";
+    } catch (error) {
+        return "";
+    }
+}
+
+function getColorSettingStatic(value, fallback) {
+    const color = (value || fallback || "").replace(/[^0-9a-fA-F]/g, "");
+    if (color.length === 3 || color.length === 6) {
+        return color;
+    }
+    return fallback;
+}
+
+function setupResponsiveStoresListStatic() {
+    if (!storesListMediaQueryStatic) {
+        storesListMediaQueryStatic = window.matchMedia("(max-width: 768px)");
+        storesListListenerStatic = handleStoresMediaChangeStatic;
+        if (typeof storesListMediaQueryStatic.addEventListener === "function") {
+            storesListMediaQueryStatic.addEventListener("change", storesListListenerStatic);
+        } else if (typeof storesListMediaQueryStatic.addListener === "function") {
+            storesListMediaQueryStatic.addListener(storesListListenerStatic);
+        }
+    }
+
+    handleStoresMediaChangeStatic();
+}
+
+function handleStoresMediaChangeStatic() {
+    const listElement = document.getElementById("storesListContainer-static");
+    const toggleButton = document.getElementById("storesToggleButton-static");
+    if (!listElement || !toggleButton) return;
+
+    const isMobile = storesListMediaQueryStatic.matches;
+
+    if (isMobile) {
+        toggleButton.removeAttribute("hidden");
+
+        if (isStoresListCollapsedStatic) {
+            listElement.classList.add("collapsed");
+            toggleButton.setAttribute("aria-expanded", "false");
+        } else {
+            listElement.classList.remove("collapsed");
+            toggleButton.setAttribute("aria-expanded", "true");
+        }
+    } else {
+        listElement.classList.remove("collapsed");
+        toggleButton.setAttribute("hidden", "hidden");
+        toggleButton.setAttribute("aria-expanded", "true");
+        isStoresListCollapsedStatic = false;
+    }
+}
+
+function toggleStoresListStatic() {
+    const listElement = document.getElementById("storesListContainer-static");
+    const toggleButton = document.getElementById("storesToggleButton-static");
+    if (!listElement || !toggleButton) return;
+
+    const shouldCollapse = !listElement.classList.contains("collapsed");
+    if (shouldCollapse) {
+        listElement.classList.add("collapsed");
+        toggleButton.setAttribute("aria-expanded", "false");
+        toggleButton.style.transform = "rotate(180deg)";
+    } else {
+        listElement.classList.remove("collapsed");
+        toggleButton.setAttribute("aria-expanded", "true");
+        toggleButton.style.transform = "rotate(0deg)";
+    }
+
+    isStoresListCollapsedStatic = shouldCollapse;
+}
+
+function cleanupStatic() {
+    if (storesListMediaQueryStatic && storesListListenerStatic)
+        storesListMediaQueryStatic.removeEventListener("change", storesListListenerStatic);
+}
+window.addEventListener("beforeunload", cleanupStatic);
+
+window.EffectifyStaticLocator = {
+    handleStoreItemClickStatic,
+    toggleStoreDetailsStatic,
+    handleDirectionStatic,
+    toggleStoresListStatic,
+    initEffectifyStatic
+};
